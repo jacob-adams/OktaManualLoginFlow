@@ -1,8 +1,12 @@
 ﻿using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.IdentityModel.Tokens;
+using OktaManualLoginFlow.Models;
 using OktaManualLoginFlow.Utility;
+using System.IdentityModel.Tokens.Jwt;
 using System.Net;
+using System.Security.Claims;
 
 namespace OktaManualLoginFlow.Controllers
 {
@@ -20,44 +24,51 @@ namespace OktaManualLoginFlow.Controllers
         }
 
         [HttpPost]
-        [ValidateAntiForgeryToken]
-        public IActionResult SignIn([FromForm] string sessionToken)
+        public async Task<IActionResult> Callback([FromForm] string code, [FromForm] string state)
         {
-            if (!HttpContext.User.Identity?.IsAuthenticated == true)
-            {
-                //var properties = new AuthenticationProperties();
-                //properties.Items.Add(OktaParams.SessionToken, sessionToken);
-                //properties.RedirectUri = "/Home/";
+            var baseUrlString = $"{_configuration.GetValue<string>("Okta:OktaDomain").EnsureTrailingSlash()}oauth2/default";
+            var tokenUrl = new Uri($"{baseUrlString}/v1/token");
 
-                //return Challenge(properties, OktaDefaults.MvcAuthenticationScheme);
-            }
+            //run it through fiddler
+            //var proxiedHttpClientHandler = new HttpClientHandler() { UseProxy = true };
+            //proxiedHttpClientHandler.Proxy = new WebProxy("127.0.0.1", 8888);
+
+            using HttpClient client = new HttpClient();// proxiedHttpClientHandler);
+
+            TokenResponse? tokenValues = await GetJwtTokens(code, tokenUrl, client);
+
+            JsonWebKeySet keySet = await GetOktaJsonKeySet(baseUrlString, client);
+
+            ClaimsPrincipal claimsPrincipal = ValidateTokenAndGetClaims(baseUrlString, tokenValues, keySet);
+
+            await HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, claimsPrincipal);
 
             return RedirectToAction("Index", "Home");
         }
 
-        [HttpPost]
-        public override SignOutResult SignOut()
+        private ClaimsPrincipal ValidateTokenAndGetClaims(string baseUrlString, TokenResponse? tokenValues, JsonWebKeySet keySet)
         {
-            return new SignOutResult(
-                new[]
-                {
-                     //OktaDefaults.MvcAuthenticationScheme,
-                     CookieAuthenticationDefaults.AuthenticationScheme,
-                },
-                new AuthenticationProperties { RedirectUri = "/Home/" });
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var tokenValidationParameters = new TokenValidationParameters()
+            {
+                IssuerSigningKeys = keySet.GetSigningKeys(),
+                ValidAudiences = new List<string>() { _configuration.GetValue<string>("Okta:ClientId") },
+                ValidIssuer = baseUrlString,
+                NameClaimType = "name",
+                RequireExpirationTime = true,
+                RequireSignedTokens = true,
+                ValidateIssuer = true,
+                ValidateAudience = true,
+                ValidateIssuerSigningKey = true,
+                ValidateLifetime = true
+            };
+            var claimsPrincipal = tokenHandler.ValidateToken(tokenValues?.IdToken, tokenValidationParameters, out SecurityToken securityToken);
+            return claimsPrincipal;
         }
 
-        [HttpPost]
-        public async Task<IActionResult> Callback([FromForm] string code, [FromForm] string state)
+        private async Task<TokenResponse?> GetJwtTokens(string code, Uri tokenUrl, HttpClient client)
         {
-            var url = new Uri($"{_configuration.GetValue<string>("Okta:OktaDomain").EnsureTrailingSlash()}oauth2/default/v1/token");
-
-            //run it through fiddler
-            var proxiedHttpClientHandler = new HttpClientHandler() { UseProxy = true };
-            proxiedHttpClientHandler.Proxy = new WebProxy("127.0.0.1", 8888);
-
-            using HttpClient client = new HttpClient(proxiedHttpClientHandler);
-            var request = new HttpRequestMessage(HttpMethod.Post, url)
+            var tokenRequest = new HttpRequestMessage(HttpMethod.Post, tokenUrl)
             {
                 Content = new FormUrlEncodedContent(new Dictionary<string, string?> {
                     { "client_id", _configuration.GetValue<string>("Okta:ClientId") },
@@ -67,13 +78,17 @@ namespace OktaManualLoginFlow.Controllers
                     { "redirect_uri", Url.Action("Callback", "Account", null, "https", null) },
                 })
             };
-            request.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+            tokenRequest.Headers.Accept.Add(new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/json"));
+            var tokenResponse = await client.SendAsync(tokenRequest);
+            return await tokenResponse.Content.ReadFromJsonAsync<TokenResponse>();
+        }
 
-            HttpResponseMessage response = await client.SendAsync(request);
-            var token = response.Content.ReadAsStringAsync().Result;
-
-            //HttpContext.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, jwtTokenClaims, authenticationProperties)
-            return RedirectToAction("Index", "Home");
+        private async Task<JsonWebKeySet> GetOktaJsonKeySet(string baseUrlString, HttpClient client)
+        {
+            var keysUrl = new Uri($"{baseUrlString}/v1/keys?clientId={_configuration.GetValue<string>("Okta:ClientId")}");
+            var keysRequest = new HttpRequestMessage(HttpMethod.Get, keysUrl);
+            var keysResponse = await client.SendAsync(keysRequest);
+            return new JsonWebKeySet(await keysResponse.Content.ReadAsStringAsync());
         }
     }
 }
