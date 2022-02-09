@@ -42,6 +42,7 @@ builder.Services.AddAuthentication(options =>
 //    };
 //});
 builder.Services.AddSingleton<IConfiguration>(builder.Configuration);
+builder.Services.AddSession();
 builder.Services.AddControllersWithViews();
 
 var app = builder.Build();
@@ -62,6 +63,8 @@ app.UseRouting();
 app.UseAuthentication();
 
 app.UseAuthorization();
+
+app.UseSession();
 
 app.MapControllerRoute(
     name: "default",

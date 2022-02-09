@@ -20,12 +20,30 @@ namespace OktaManualLoginFlow.Controllers
         }
         public IActionResult SignIn()
         {
+            string stateValue = CryptoHelper.GenerateRandomString();
+            string nonceValue = CryptoHelper.GenerateRandomString();
+            HttpContext.Session.SetString("okta-state", stateValue);
+            HttpContext.Session.SetString("okta-nonce", nonceValue);
+
+            ViewData["state"] = stateValue;
+            ViewData["nonce"] = nonceValue;
+
             return View();
         }
 
-        [HttpPost]
-        public async Task<IActionResult> Callback([FromForm] string code, [FromForm] string state)
+        public new async Task<IActionResult> SignOut()
         {
+            await HttpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+            return RedirectToAction("Index", "Home");
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> Callback([FromQuery] string code, [FromQuery] string state)
+        {
+            if (!state.Equals(HttpContext.Session.GetString("okta-state")))
+            {
+                throw new StateMismatchException("state token did not match.");
+            }
             var baseUrlString = $"{_configuration.GetValue<string>("Okta:OktaDomain").EnsureTrailingSlash()}oauth2/default";
             var tokenUrl = new Uri($"{baseUrlString}/v1/token");
 
@@ -60,9 +78,19 @@ namespace OktaManualLoginFlow.Controllers
                 ValidateIssuer = true,
                 ValidateAudience = true,
                 ValidateIssuerSigningKey = true,
-                ValidateLifetime = true
+                ValidateLifetime = true,
+                ValidAlgorithms = new List<string> { SecurityAlgorithms.RsaSha256 },
+                ClockSkew = TimeSpan.FromMinutes(2)
             };
             var claimsPrincipal = tokenHandler.ValidateToken(tokenValues?.IdToken, tokenValidationParameters, out SecurityToken securityToken);
+
+            bool nonceMatches = ((JwtSecurityToken)securityToken).Payload.TryGetValue("nonce", out var nonce) && nonce.ToString().Equals(HttpContext.Session.GetString("okta-nonce"));
+
+            if (!nonceMatches)
+            {
+                throw new SecurityTokenValidationException("The nonce is invalid.");
+            }
+
             return claimsPrincipal;
         }
 
